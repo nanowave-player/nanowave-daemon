@@ -9,6 +9,21 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
 
+#[derive(Clone)]
+struct Player;
+
+impl Player {
+    fn new() -> Self {
+        Player
+    }
+
+    async fn play_media(&self, id: String) {
+        // Replace with real media playback logic
+        println!("▶️ Playing media with id: {}", id);
+    }
+}
+
+
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
     jsonrpc: String,
@@ -46,6 +61,7 @@ struct ClientHandle {
 struct Api {
     counter: Arc<Mutex<u64>>,
     clients: Arc<Mutex<Vec<ClientHandle>>>,
+    player: Arc<Player>,
 }
 
 impl Api {
@@ -53,6 +69,7 @@ impl Api {
         Self {
             counter: Arc::new(Mutex::new(0)),
             clients: Arc::new(Mutex::new(Vec::new())),
+            player: Arc::new(Player::new()),
         }
     }
 
@@ -101,6 +118,28 @@ impl Api {
                 Ok(serde_json::to_value(value).unwrap())
             }
             "echo" => Ok(params.unwrap_or(Value::Null)),
+
+            "player_play_media" => {
+                #[derive(Deserialize)]
+                struct PlayParams {
+                    id: String,
+                }
+
+                let params: PlayParams = serde_json::from_value(
+                    params.ok_or(JsonRpcError {
+                        code: -32602,
+                        message: "Missing params".into(),
+                    })?,
+                )
+                    .map_err(|_| JsonRpcError {
+                        code: -32602,
+                        message: "Invalid params".into(),
+                    })?;
+
+                self.player.play_media(params.id).await;
+
+                Ok(serde_json::json!({ "status": "playing" }))
+            },
             _ => Err(JsonRpcError {
                 code: -32601,
                 message: "Method not found".into(),
