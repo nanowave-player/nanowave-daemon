@@ -1,28 +1,39 @@
+
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc};
+use std::thread;
+use sea_orm::{Database, DatabaseConnection, DbErr};
+use sea_orm_migration::MigratorTrait;
 use tokio::sync::Mutex;
+use clap::Parser;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
+use crate::entity::{item, items_json_metadata, items_metadata, items_progress_history};
+use crate::media_source::file_media_source::FileMediaSource;
+use crate::migrator::Migrator;
+use crate::player::player::Player;
 
-#[derive(Clone)]
-struct Player;
 
-impl Player {
-    fn new() -> Self {
-        Player
-    }
 
-    async fn play_media(&self, id: String) {
-        // Replace with real media playback logic
-        println!("▶️ Playing media with id: {}", id);
-    }
-}
+mod gpio_button_service;
+mod headset;
+mod player;
 
+mod entity;
+mod migrator;
+
+mod button_handler;
+mod media_source;
+mod debouncer;
+mod audio;
+mod display;
+mod time;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
@@ -61,15 +72,15 @@ struct ClientHandle {
 struct Api {
     counter: Arc<Mutex<u64>>,
     clients: Arc<Mutex<Vec<ClientHandle>>>,
-    player: Arc<Player>,
+    player: Arc<Mutex<Player>>,
 }
 
 impl Api {
-    fn new() -> Self {
+    fn new(player: Player) -> Self {
         Self {
             counter: Arc::new(Mutex::new(0)),
             clients: Arc::new(Mutex::new(Vec::new())),
-            player: Arc::new(Player::new()),
+            player: Arc::new(Mutex::new(player)),
         }
     }
 
@@ -78,6 +89,7 @@ impl Api {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, JsonRpcError> {
+        let mut player = self.player.lock().await;
         match method {
             "add" => {
                 let nums: Vec<f64> = serde_json::from_value(
@@ -136,7 +148,7 @@ impl Api {
                         message: "Invalid params".into(),
                     })?;
 
-                self.player.play_media(params.id).await;
+                player.play_media(params.id).await;
 
                 Ok(serde_json::json!({ "status": "playing" }))
             },
@@ -245,10 +257,103 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, api: Api) {
     api.server_status_broadcast().await;
 }
 
+
+
+async fn connect_db(db_url: &str, first_run: bool) -> Result<DatabaseConnection, DbErr> {
+    let db = Database::connect(db_url).await?;
+    // todo: dirty hack to prevent startup failure if db exists
+    // this has to be solved with migrations or at least better than this
+    if first_run {
+        db.get_schema_builder()
+            .register(item::Entity)
+            .register(items_metadata::Entity)
+            .register(items_json_metadata::Entity)
+            .register(items_progress_history::Entity)
+            .apply(&db)
+            .await?;
+    }
+    Migrator::up(&db, None).await?;
+    Ok(db)
+}
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value = "./")]
+    base_directory: String,
+}
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .init();
+
+    let args = Args::parse();
+    let base_dir = args.base_directory.clone();
+    println!("base directory is: {}", base_dir.clone());
+    let base_path = Path::new(&base_dir);
+    if !Path::exists(base_path) {
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                println!(
+                    "base directory does not exist: {:?}, current dir is: {:?}",
+                    base_path, cwd
+                );
+            }
+            Err(_) => {
+                println!("base directory does not exist: {}", args.base_directory);
+            }
+        }
+
+        return; /* Err(format!(
+            "Base directory does not exist: {}",
+            args.base_directory
+        ));*/
+    }
+
+    let db_path = format!(
+        "{}/{}",
+        base_dir.clone().trim_end_matches("/"),
+        String::from("player.db")
+    );
+    let first_run = !Path::new(&db_path).exists();
+    let db_url = format!("sqlite://{}?mode=rwc", db_path);
+
+    let connect_result = connect_db(&db_url, first_run).await;
+    if connect_result.is_err() {
+        /*
+        return Err(slint::PlatformError::Other(format!(
+            "Could not find, create or migrate database: {}",
+            connect_result.err().unwrap()
+        )));
+         */
+        return;
+    }
+
+    let db = connect_result.unwrap();
+
+    let file_source = FileMediaSource::new(db.clone(), args.base_directory);
+    let fs_clone1 = file_source.clone();
+    fs_clone1.scan_media().await;
+    // let fs_clone2 = file_source.clone();
+
+    /*
+    //
+    tokio::spawn(async move {
+        fs_clone1.scan_media().await;
+        // fs_clone1.run(source_cmd_rx, source_evt_tx).await;
+    });
+    */
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
-    let api = Api::new();
+
+    let player = Player::new(
+        Arc::new(fs_clone1),
+        "USB-C to 3.5mm Headphone Jack A".to_string(),
+        "pipewire".to_string(),
+    );
+
+
+    let api = Api::new(player);
 
     let api_clone = api.clone();
     tokio::spawn(async move {

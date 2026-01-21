@@ -1,0 +1,2 @@
+[patch.crates-io]
+media_source = { path = "../media_source/" } # use for local git (see cargo.toml)
