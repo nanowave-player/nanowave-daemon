@@ -1,76 +1,45 @@
-
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::net::SocketAddr;
+use crate::media_source::media_source::MediaSource;
 use std::path::Path;
-use std::sync::{Arc};
-use std::thread;
+use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
 use sea_orm::{Database, DatabaseConnection, DbErr};
 use sea_orm_migration::MigratorTrait;
-use tokio::sync::Mutex;
-use clap::Parser;
-
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{interval, Duration};
-use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
+use tokio_tungstenite::accept_async;
 use crate::entity::{item, items_json_metadata, items_metadata, items_progress_history};
 use crate::media_source::file_media_source::FileMediaSource;
 use crate::migrator::Migrator;
-use crate::player::player::Player;
-use crate::media_source::media_source::MediaSource;
-
-
-mod gpio_button_service;
-mod headset;
-mod player;
 
 mod entity;
 mod migrator;
-
-mod button_handler;
 mod media_source;
-mod debouncer;
-mod audio;
-mod display;
-mod time;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    method: String,
-    params: Option<Value>,
-    id: Option<Value>,
-}
 
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    result: Option<Value>,
-    error: Option<JsonRpcError>,
-    id: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
-}
 
 #[derive(Clone)]
-struct ClientHandle {
-    addr: SocketAddr,
-    write: Arc<Mutex<
-        futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<TcpStream>,
-            Message,
-        >
-    >>,
+struct Api {
+    media_source: FileMediaSource,
 }
 
-#[derive(Deserialize)]
-struct PlayerPlayMediaParams {
-    id: String,
+
+impl Api {
+    async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+        match req.method.as_str() {
+            "media_source_filter" => {
+                let params: MediaSourceFilterParams =
+                    serde_json::from_value(req.params.unwrap_or(Value::Null))
+                        .unwrap_or(MediaSourceFilterParams {
+                            query: String::new(),
+                        });
+
+                let result = self.media_source.filter(params.query.as_str()).await;
+                JsonRpcResponse::success(req.id, json!(result))
+            }
+            _ => JsonRpcResponse::error(req.id, "Unknown method"),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -78,185 +47,42 @@ struct MediaSourceFilterParams {
     query: String,
 }
 
-
-
-#[derive(Clone)]
-struct Api {
-    counter: Arc<Mutex<u64>>,
-    clients: Arc<Mutex<Vec<ClientHandle>>>,
-    player: Arc<Mutex<Player>>,
-    media_source: Arc<Mutex<FileMediaSource>>,
+#[derive(Deserialize)]
+struct JsonRpcRequest {
+    jsonrpc: String,
+    method: String,
+    params: Option<Value>,
+    id: Value,
 }
 
-impl Api {
-    fn new(player: Player, media_source: FileMediaSource) -> Self {
+#[derive(Serialize)]
+struct JsonRpcResponse {
+    jsonrpc: &'static str,
+    result: Option<Value>,
+    error: Option<Value>,
+    id: Value,
+}
+
+impl JsonRpcResponse {
+    fn success(id: Value, result: Value) -> Self {
         Self {
-            counter: Arc::new(Mutex::new(0)),
-            clients: Arc::new(Mutex::new(Vec::new())),
-            player: Arc::new(Mutex::new(player)),
-            media_source: Arc::new(Mutex::new(media_source)),
+            jsonrpc: "2.0",
+            result: Some(result),
+            error: None,
+            id,
         }
     }
 
-    async fn handle_client_method(
-        &self,
-        method: &str,
-        params: Option<Value>,
-    ) -> Result<Value, JsonRpcError> {
-        let mut player = self.player.lock().await;
-        let mut media_source = self.media_source.lock().await;
-        match method {
-            "echo" => Ok(params.unwrap_or(Value::Null)),
-
-            "player_play_media" => {
-
-                let params: PlayerPlayMediaParams = serde_json::from_value(
-                    params.ok_or(JsonRpcError {
-                        code: -32602,
-                        message: "Missing params".into(),
-                    })?,
-                )
-                    .map_err(|_| JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params".into(),
-                    })?;
-
-                player.play_media(params.id).await;
-
-                Ok(serde_json::json!({ "status": "playing" }))
-            },
-            "media_source_filter" => {
-                let params: MediaSourceFilterParams = serde_json::from_value(
-                    params.ok_or(JsonRpcError {
-                        code: -32602,
-                        message: "Missing params".into(),
-                    })?,
-                )
-                    .map_err(|_| JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params".into(),
-                    })?;
-                let filter_results = media_source.filter(params.query.as_str()).await;
-
-                Ok(serde_json::json!({ "results": filter_results }))
-            },
-            _ => Err(JsonRpcError {
-                code: -32601,
-                message: "Method not found".into(),
-            }),
+    fn error(id: Value, message: &str) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            result: None,
+            error: Some(json!({ "message": message })),
+            id,
         }
-    }
-
-    async fn notify_all_clients(&self, method: &str, params: Value) {
-        let clients = self.clients.lock().await.clone();
-
-        let msg = Message::Text(
-            serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params
-        })
-                .to_string().into(),
-        );
-
-        for client in clients {
-            let mut write = client.write.lock().await;
-            let _ = write.send(msg.clone()).await;
-        }
-    }
-
-
-    async fn server_ping_all(&self) {
-        self.notify_all_clients(
-            "server_ping",
-            serde_json::json!({ "timestamp": chrono::Utc::now().to_rfc3339() }),
-        )
-            .await;
-    }
-
-    async fn server_status_broadcast(&self) {
-        let counter = *self.counter.lock().await;
-        let clients = self.clients.lock().await.len();
-
-        self.notify_all_clients(
-            "server_status",
-            serde_json::json!({ "counter": counter, "clients": clients }),
-        )
-            .await;
     }
 }
 
-
-async fn handle_connection(stream: TcpStream, addr: SocketAddr, api: Api) {
-    let ws = accept_async(stream).await.unwrap();
-    let (write, mut read) = ws.split();
-
-    let client = ClientHandle {
-        addr,
-        write: Arc::new(Mutex::new(write)),
-    };
-
-    api.clients.lock().await.push(client.clone());
-    api.server_status_broadcast().await;
-
-    while let Some(msg) = read.next().await {
-        let msg = match msg {
-            Ok(Message::Text(t)) => t,
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => continue,
-        };
-
-        println!("message: {:?}", msg);
-
-        let req: JsonRpcRequest = match serde_json::from_str(&msg) {
-            Ok(r) => {
-                println!("request: {:?}", r);
-                r
-            },
-            Err(_) => continue,
-        };
-
-        if let Some(id) = req.id {
-            let result = api
-                .handle_client_method(&req.method, req.params)
-                .await;
-
-
-
-            let response = if let Ok(ok) = result {
-                println!("response ok: {:?}", ok);
-
-                println!("ok response: {}", ok);
-                JsonRpcResponse {
-                    jsonrpc: "2.0".into(),
-                    result: Some(ok),
-                    error: None,
-                    id,
-                };
-            } else {
-                println!("response error");
-
-                JsonRpcResponse {
-                    jsonrpc: "2.0".into(),
-                    result: None,
-                    error: result.err(),
-                    id,
-                };
-            };
-
-            let mut write = client.write.lock().await;
-            println!("sending response");
-            let _ = write
-                .send(Message::Text(
-                    serde_json::to_string(&response).unwrap().into(),
-                ))
-                .await;
-        }
-    }
-
-    api.clients.lock().await.retain(|c| c.addr != addr);
-    api.server_status_broadcast().await;
-}
 
 
 
@@ -282,6 +108,7 @@ struct Args {
     #[arg(short, long, default_value = "./media/")]
     base_directory: String,
 }
+
 #[tokio::main]
 async fn main() {
     /*
@@ -337,36 +164,36 @@ async fn main() {
     let file_source = FileMediaSource::new(db.clone(), args.base_directory);
     let fs_clone1 = file_source.clone();
     fs_clone1.scan_media().await;
-    // let fs_clone2 = file_source.clone();
 
 
-/*
-    tokio::spawn(async move {
-        fs_clone1.scan_media().await;
-        // fs_clone1.run(source_cmd_rx, source_evt_tx).await;
-    });
-*/
+
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
+    let api = Api {
+        media_source: file_source,
+    };
 
-    let player = Player::new(
-        Arc::new(fs_clone1),
-        "USB-C to 3.5mm Headphone Jack A".to_string(),
-        "pipewire".to_string(),
-    );
+    println!("WebSocket server listening on ws://127.0.0.1:8080");
 
+    while let Ok((stream, _)) = listener.accept().await {
+        let api = api.clone();
 
-    let api = Api::new(player, file_source);
+        tokio::spawn(async move {
+            let ws_stream = accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws_stream.split();
 
-    let api_clone = api.clone();
-    tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(10));
-        loop {
-            tick.tick().await;
-            api_clone.server_ping_all().await;
-        }
-    });
+            while let Some(Ok(msg)) = read.next().await {
+                if !msg.is_text() {
+                    continue;
+                }
 
-    while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream, addr, api.clone()));
+                let req: JsonRpcRequest =
+                    serde_json::from_str(msg.to_text().unwrap()).unwrap();
+
+                let resp = api.handle_request(req).await;
+                let text = serde_json::to_string(&resp).unwrap();
+
+                write.send(text.into()).await.unwrap();
+            }
+        });
     }
 }
