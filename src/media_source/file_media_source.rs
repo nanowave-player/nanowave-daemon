@@ -1,23 +1,23 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Local, Utc};
 use image::imageops::FilterType;
-use image::{load_from_memory, DynamicImage, GenericImageView};
+use image::{load_from_memory, GenericImageView};
 use lofty::error::LoftyError;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::MimeType;
 use lofty::probe::Probe;
 use lofty::tag::TagType::Mp4Ilst;
 use lofty::tag::{Accessor, Tag};
+use media_source::media_source_chapter::MediaSourceChapter;
+use media_source::media_source_image_codec::MediaSourceImageCodec;
+use media_source::media_source_item::MediaSourceItem;
 use std::{
     fs,
-    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration
 };
-use media_source::media_source_chapter::MediaSourceChapter;
-use media_source::media_source_image_codec::MediaSourceImageCodec;
-use media_source::media_source_item::MediaSourceItem;
+use file_id::get_file_id;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use walkdir::WalkDir;
 
@@ -26,13 +26,13 @@ use crate::entity::items_json_metadata::JsonTagField::Chapters;
 use crate::entity::items_metadata::TagField::*;
 use crate::entity::items_metadata::{Entity, TagField};
 use crate::entity::{item, items_json_metadata, items_metadata};
+use crate::media_source::media_source::MediaSource;
+use crate::media_source::media_source_command::MediaSourceCommand;
+use crate::media_source::media_source_event::MediaSourceEvent;
 use mp4ameta::FreeformIdent;
 use sea_orm::prelude::HasMany;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, HasManyModel, QueryFilter};
 use xxhash_rust::xxh3::xxh3_64;
-use crate::media_source::media_source::MediaSource;
-use crate::media_source::media_source_command::MediaSourceCommand;
-use crate::media_source::media_source_event::MediaSourceEvent;
 
 use media_source::media_source_metadata::MediaSourceMetadata;
 use media_source::media_source_picture::MediaSourcePicture;
@@ -73,7 +73,7 @@ impl FileMediaSource {
             chapters: vec![],
         }
     }
-    pub fn map_db_model_to_media_item(&self, i: &item::ModelEx, metadata: &HasMany<items_metadata::Entity>, json: &HasMany<items_json_metadata::Entity>) -> MediaSourceItem {
+    pub fn map_db_model_to_media_item(&self, i: &item::ModelEx, metadata: &HasMany<Entity>, json: &HasMany<items_json_metadata::Entity>) -> MediaSourceItem {
         let mut title : String = String::from("");
         let mut genre : Option<String> = None;
         let mut artist : Option<String> = None;
@@ -278,17 +278,12 @@ impl FileMediaSource {
                 item::MediaType::Unspecified
             };
 
-            // update file modification time
-            // let file = File::create("Foo.txt").unwrap();
-            // file.set_modified(SystemTime::now()).unwrap();
-
-
-            let file_id = file_id::get_file_id(full_path.clone()).unwrap();
+            let file_id = get_file_id(full_path.clone()).unwrap();
             let file_id_str = format!("{:?}", file_id);
             let file_date_modified = audio_file.path().metadata().unwrap().modified().unwrap();
             let file_date_mod_compare: DateTime<Local> = DateTime::from(file_date_modified);
 
-            let item_result = item::Entity::find()
+            let item_result = Entity::find()
                 .filter(item::Column::FileId.eq(file_id_str.clone()))
                 .one(&db)
                 .await;
@@ -324,22 +319,7 @@ impl FileMediaSource {
         }
     }
 
-
-
-
     async fn extract_metadata(&self, path: String) -> Result<MediaSourceMetadata, LoftyError> {
-
-        /*
-let read_cfg = ReadConfig {
-read_meta_items: true,
-read_image_data: false,
-read_chapter_list: false,
-read_chapter_track: false,
-read_audio_info: false,
-chpl_timescale: ChplTimescale::DEFAULT,
-};
-let mut tag = Tag::read_with_path("music.m4a", &read_cfg).unwrap();
- */
 
         let tagged_file = Probe::open(path.clone())?.guess_file_type()?.read()?;
         let tag_result = match tagged_file.primary_tag() {
@@ -392,13 +372,6 @@ let mut tag = Tag::read_with_path("music.m4a", &read_cfg).unwrap();
         }
         chapters.reverse();
         meta.chapters = chapters;
-        // https://github.com/saecki/mp4ameta/issues/35
-        // tag.itunes_string("ASIN");
-        // let artist_ident = Fourcc(*b"\xa9mvmt");
-        // mp4tag.movement()
-
-        // composer = ©wrt => Fourcc(*b"\xa9wrt")
-
 
         let movement = mp4tag.movement();
         let movement_index = mp4tag.movement_index();
@@ -429,13 +402,8 @@ let mut tag = Tag::read_with_path("music.m4a", &read_cfg).unwrap();
         let mut pics: Vec<MediaSourcePicture> = Vec::new();
 
         for pic in tag.pictures() {
-            // todo: use self.pic_full_path (refactoring required)
-            // probably implement location() on MediaSourcePicture to return the full path
-            // and tb_location for the thumbnail?
-
             let hash_u64 = xxh3_64(&pic.data());
             let hash = format!("{:016x}", hash_u64); // 16 chars, lowercase, zero-padded
-            let codec = mime_to_codec(pic.mime_type());
 
             let media_source_picture = MediaSourcePicture {
                 cache_dir: self.cache_path(),
@@ -452,11 +420,11 @@ let mut tag = Tag::read_with_path("music.m4a", &read_cfg).unwrap();
 
             let pic_full_path_exists = pic_full_path.exists();
             if !pic_full_path_exists {
-                resize_image_bytes_to_file(&pic.data(), &pic_full_path, 368, 368);
+                let _ = resize_image_bytes_to_file(&pic.data(), &pic_full_path, 368, 368);
             }
 
             if !tb_full_path.exists() {
-                resize_image_bytes_to_file(&pic.data(), &tb_full_path, 192, 192);
+                let _ = resize_image_bytes_to_file(&pic.data(), &tb_full_path, 192, 192);
             }
 
             pics.push(media_source_picture);
@@ -502,7 +470,7 @@ impl MediaSource for FileMediaSource {
 
         let items = item::Entity::load()
                 .filter(item::Column::MediaType.eq(media_type))
-                .with(items_metadata::Entity)
+                .with(Entity)
                 .all(&db)
                 .await;
         if items.is_err() {
@@ -521,7 +489,7 @@ impl MediaSource for FileMediaSource {
         let db = self.db.clone();
         let items = item::Entity::load()
             .filter(item::Column::Id.eq(id))
-            .with(items_metadata::Entity)
+            .with(Entity)
             .with(items_json_metadata::Entity)
             .one(&db)
             .await;
@@ -580,21 +548,4 @@ fn resize_image_bytes_to_file(
     resized.save_with_format(output_path, img_format)?;
 
     Ok(())
-}
-
-
-fn mime_to_codec( mime_type_opt: Option<&MimeType>) -> MediaSourceImageCodec {
-    let unknown_ext = String::from("dat");
-    if let Some(mime_type) = mime_type_opt {
-        let result = match mime_type {
-            MimeType::Png => MediaSourceImageCodec::Png,
-            MimeType::Jpeg => MediaSourceImageCodec::Jpeg,
-            MimeType::Tiff => MediaSourceImageCodec::Tiff,
-            MimeType::Bmp => MediaSourceImageCodec::Jpeg,
-            MimeType::Gif => MediaSourceImageCodec::Gif,
-            _ => MediaSourceImageCodec::Unknown
-        };
-        return result;
-    }
-    MediaSourceImageCodec::Unknown
 }

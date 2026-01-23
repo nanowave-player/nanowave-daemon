@@ -18,7 +18,7 @@ use crate::entity::{item, items_json_metadata, items_metadata, items_progress_hi
 use crate::media_source::file_media_source::FileMediaSource;
 use crate::migrator::Migrator;
 use crate::player::player::Player;
-
+use crate::media_source::media_source::MediaSource;
 
 
 mod gpio_button_service;
@@ -68,19 +68,33 @@ struct ClientHandle {
     >>,
 }
 
+#[derive(Deserialize)]
+struct PlayerPlayMediaParams {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct MediaSourceFilterParams {
+    query: String,
+}
+
+
+
 #[derive(Clone)]
 struct Api {
     counter: Arc<Mutex<u64>>,
     clients: Arc<Mutex<Vec<ClientHandle>>>,
     player: Arc<Mutex<Player>>,
+    media_source: Arc<Mutex<FileMediaSource>>,
 }
 
 impl Api {
-    fn new(player: Player) -> Self {
+    fn new(player: Player, media_source: FileMediaSource) -> Self {
         Self {
             counter: Arc::new(Mutex::new(0)),
             clients: Arc::new(Mutex::new(Vec::new())),
             player: Arc::new(Mutex::new(player)),
+            media_source: Arc::new(Mutex::new(media_source)),
         }
     }
 
@@ -90,54 +104,13 @@ impl Api {
         params: Option<Value>,
     ) -> Result<Value, JsonRpcError> {
         let mut player = self.player.lock().await;
+        let mut media_source = self.media_source.lock().await;
         match method {
-            "add" => {
-                let nums: Vec<f64> = serde_json::from_value(
-                    params.unwrap_or(Value::Array(vec![])),
-                )
-                    .map_err(|_| JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params".into(),
-                    })?;
-                Ok(serde_json::to_value(nums.iter().sum::<f64>()).unwrap())
-            }
-            "multiply" => {
-                let nums: Vec<f64> = serde_json::from_value(
-                    params.unwrap_or(Value::Array(vec![])),
-                )
-                    .map_err(|_| JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params".into(),
-                    })?;
-                Ok(serde_json::to_value(nums.iter().product::<f64>()).unwrap())
-            }
-            "get_counter" => {
-                let counter = *self.counter.lock().await;
-                Ok(serde_json::to_value(counter).unwrap())
-            }
-            "increment_counter" => {
-                let mut counter = self.counter.lock().await;
-                *counter += 1;
-                let value = *counter;
-                drop(counter);
-
-                self.notify_all_clients(
-                    "counter_updated",
-                    serde_json::to_value(value).unwrap(),
-                )
-                    .await;
-
-                Ok(serde_json::to_value(value).unwrap())
-            }
             "echo" => Ok(params.unwrap_or(Value::Null)),
 
             "player_play_media" => {
-                #[derive(Deserialize)]
-                struct PlayParams {
-                    id: String,
-                }
 
-                let params: PlayParams = serde_json::from_value(
+                let params: PlayerPlayMediaParams = serde_json::from_value(
                     params.ok_or(JsonRpcError {
                         code: -32602,
                         message: "Missing params".into(),
@@ -151,6 +124,21 @@ impl Api {
                 player.play_media(params.id).await;
 
                 Ok(serde_json::json!({ "status": "playing" }))
+            },
+            "media_source_filter" => {
+                let params: MediaSourceFilterParams = serde_json::from_value(
+                    params.ok_or(JsonRpcError {
+                        code: -32602,
+                        message: "Missing params".into(),
+                    })?,
+                )
+                    .map_err(|_| JsonRpcError {
+                        code: -32602,
+                        message: "Invalid params".into(),
+                    })?;
+                let filter_results = media_source.filter(params.query.as_str()).await;
+
+                Ok(serde_json::json!({ "results": filter_results }))
             },
             _ => Err(JsonRpcError {
                 code: -32601,
@@ -218,8 +206,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, api: Api) {
             _ => continue,
         };
 
+        println!("message: {:?}", msg);
+
         let req: JsonRpcRequest = match serde_json::from_str(&msg) {
-            Ok(r) => r,
+            Ok(r) => {
+                println!("request: {:?}", r);
+                r
+            },
             Err(_) => continue,
         };
 
@@ -228,7 +221,12 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, api: Api) {
                 .handle_client_method(&req.method, req.params)
                 .await;
 
+
+
             let response = if let Ok(ok) = result {
+                println!("response ok: {:?}", ok);
+
+                println!("ok response: {}", ok);
                 JsonRpcResponse {
                     jsonrpc: "2.0".into(),
                     result: Some(ok),
@@ -236,6 +234,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, api: Api) {
                     id,
                 };
             } else {
+                println!("response error");
+
                 JsonRpcResponse {
                     jsonrpc: "2.0".into(),
                     result: None,
@@ -245,6 +245,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, api: Api) {
             };
 
             let mut write = client.write.lock().await;
+            println!("sending response");
             let _ = write
                 .send(Message::Text(
                     serde_json::to_string(&response).unwrap().into(),
@@ -278,16 +279,17 @@ async fn connect_db(db_url: &str, first_run: bool) -> Result<DatabaseConnection,
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value = "./")]
+    #[arg(short, long, default_value = "./media/")]
     base_directory: String,
 }
 #[tokio::main]
 async fn main() {
+    /*
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_test_writer()
         .init();
-
+    */
     let args = Args::parse();
     let base_dir = args.base_directory.clone();
     println!("base directory is: {}", base_dir.clone());
@@ -337,13 +339,13 @@ async fn main() {
     fs_clone1.scan_media().await;
     // let fs_clone2 = file_source.clone();
 
-    /*
-    //
+
+/*
     tokio::spawn(async move {
         fs_clone1.scan_media().await;
         // fs_clone1.run(source_cmd_rx, source_evt_tx).await;
     });
-    */
+*/
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
 
     let player = Player::new(
@@ -353,7 +355,7 @@ async fn main() {
     );
 
 
-    let api = Api::new(player);
+    let api = Api::new(player, file_source);
 
     let api_clone = api.clone();
     tokio::spawn(async move {
