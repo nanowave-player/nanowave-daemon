@@ -28,3 +28,4 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 image = "0.25.9"
 parking_lot = "0.12.5"
 media_source = "0.1.0"
+anyhow = "1.0.100"

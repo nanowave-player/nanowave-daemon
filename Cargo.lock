@@ -1737,6 +1737,7 @@ checksum = "453e991b2efe96c288cbc2d03a19e353504294559ecb6c03067fff5bd824616d"
 name = "nanowave-daemon"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "clap",

@@ -1,5 +1,7 @@
 use crate::media_source::media_source::MediaSource;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use sea_orm::{Database, DatabaseConnection, DbErr};
@@ -8,83 +10,101 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
+use crate::api::Api;
 use crate::entity::{item, items_json_metadata, items_metadata, items_progress_history};
+use crate::json_rpc_handler::{JsonRpcHandler,JsonRpcRequest};
 use crate::media_source::file_media_source::FileMediaSource;
 use crate::migrator::Migrator;
+use crate::player::player::Player;
 
 mod entity;
 mod migrator;
 mod media_source;
 
-
-
+mod player;
+mod api_command;
+mod json_rpc_handler;
+mod api;
+/*
 #[derive(Clone)]
 struct Api {
+    player: Player,
     media_source: FileMediaSource,
+    // preferences: Preferences,
 }
 
-
 impl Api {
-    async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
-        match req.method.as_str() {
-            "media_source_filter" => {
-                let params: MediaSourceFilterParams =
-                    serde_json::from_value(req.params.unwrap_or(Value::Null))
-                        .unwrap_or(MediaSourceFilterParams {
-                            query: String::new(),
-                        });
+    pub fn emit_event(&self, method: &str, params: serde_json::Value) {
+        // This is intentionally transport-agnostic.
+        // Your websocket layer can subscribe to these.
+        let event = JsonRpcResponse {
+            jsonrpc: "2.0",
+            result: None,
+            error: None,
+            id: serde_json::Value::Null,
+        };
 
+        let _ = (method, params, event);
+        // hook into your outbound message bus here
+    }
+
+    async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+        let mut player = self.player.clone();
+        match req.method.as_str() {
+            // Player
+            "player_play_media" => {
+                let params: PlayMediaParams = parse_params(req.params);
+                player.play_media(params.id).await;
+                JsonRpcResponse::success(req.id, json!(true))
+            }
+            "player_play" => {
+                player.play();
+                JsonRpcResponse::success(req.id, json!(true))
+            }
+            "player_pause" => {
+                player.pause();
+                JsonRpcResponse::success(req.id, json!(true))
+            }
+            "player_seek" => {
+                let params: SeekParams = parse_params(req.params);
+                player
+                    .try_seek(Duration::from_secs(params.pos));
+
+                JsonRpcResponse::success(req.id, json!(true))
+            }
+
+            // FileMediaSource
+            "file_media_source_filter" => {
+                let params: MediaSourceFilterParams = parse_params(req.params);
                 let result = self.media_source.filter(params.query.as_str()).await;
                 JsonRpcResponse::success(req.id, json!(result))
             }
+            "file_media_source_find" => {
+                let params: MediaSourceFindParams = parse_params(req.params);
+                let result = self.media_source.find(params.id.as_str()).await;
+                JsonRpcResponse::success(req.id, json!(result))
+            }
+
+            /*
+            // Preferences
+            "preferences_update" => {
+                let params: PreferencesUpdateParams = parse_params(req.params);
+                self.preferences
+                    .update(params.key, params.value)
+                    .await;
+                JsonRpcResponse::success(req.id, json!(true))
+            }
+
+             */
+
             _ => JsonRpcResponse::error(req.id, "Unknown method"),
         }
     }
 }
-
-#[derive(Deserialize)]
-struct MediaSourceFilterParams {
-    query: String,
-}
-
-#[derive(Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    method: String,
-    params: Option<Value>,
-    id: Value,
-}
-
-#[derive(Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    result: Option<Value>,
-    error: Option<Value>,
-    id: Value,
-}
-
-impl JsonRpcResponse {
-    fn success(id: Value, result: Value) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            result: Some(result),
-            error: None,
-            id,
-        }
-    }
-
-    fn error(id: Value, message: &str) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            result: None,
-            error: Some(json!({ "message": message })),
-            id,
-        }
-    }
-}
-
-
-
+*/
+/* =======================
+   Params structs
+   ======================= */
 
 async fn connect_db(db_url: &str, first_run: bool) -> Result<DatabaseConnection, DbErr> {
     let db = Database::connect(db_url).await?;
@@ -161,25 +181,45 @@ async fn main() {
 
     let db = connect_result.unwrap();
 
-    let file_source = FileMediaSource::new(db.clone(), args.base_directory);
-    let fs_clone1 = file_source.clone();
-    fs_clone1.scan_media().await;
 
+
+    let media_source = FileMediaSource::new(db.clone(), args.base_directory);
+    let media_source_clone = media_source.clone();
+    media_source_clone.scan_media().await;
+
+
+    let player = Player::new(
+        media_source_clone,
+        vec!["USB-C to 3.5mm Headphone Jack A", "pipewire"]
+    );
+    player.run_in_background();
+    player.play_test().await;
+
+    // let player_clone = player.clone();
+    // let _ = player_clone.play_test().await;
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (evt_tx, _evt_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let mut api = Api::new(player, media_source, cmd_rx, evt_tx);
+    tokio::spawn(async move {
+        api.run().await;
+    });
 
 
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
-    let api = Api {
-        media_source: file_source,
-    };
+
 
     println!("WebSocket server listening on ws://127.0.0.1:8080");
 
+    let handler = JsonRpcHandler::new(cmd_tx);
+
     while let Ok((stream, _)) = listener.accept().await {
-        let api = api.clone();
+        let handler = handler.clone();
 
         tokio::spawn(async move {
-            let ws_stream = accept_async(stream).await.unwrap();
-            let (mut write, mut read) = ws_stream.split();
+            let ws = accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws.split();
 
             while let Some(Ok(msg)) = read.next().await {
                 if !msg.is_text() {
@@ -189,11 +229,12 @@ async fn main() {
                 let req: JsonRpcRequest =
                     serde_json::from_str(msg.to_text().unwrap()).unwrap();
 
-                let resp = api.handle_request(req).await;
+                let resp = handler.handle_request(req).await;
                 let text = serde_json::to_string(&resp).unwrap();
 
                 write.send(text.into()).await.unwrap();
             }
         });
     }
+
 }
