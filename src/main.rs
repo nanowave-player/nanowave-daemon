@@ -1,18 +1,21 @@
-use crate::media_source::media_source::MediaSource;
+use sea_orm::ColumnTrait;
+use sea_orm::QueryFilter;
+use crate::media_source::media_source::{MediaSource, MediaSourceCommand, MediaSourceEvent};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use sea_orm::{Database, DatabaseConnection, DbErr};
+use sea_orm::{Database, DatabaseConnection, DbErr, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_tungstenite::accept_async;
 use crate::api::Api;
 use crate::entity::{item, items_json_metadata, items_metadata, items_progress_history};
-use crate::json_rpc_handler::{JsonRpcHandler,JsonRpcRequest};
+use crate::json_rpc_handler::{JsonRpcDispatcher, JsonRpcRequest, MediaSourceRpcHandler};
 use crate::media_source::file_media_source::FileMediaSource;
 use crate::migrator::Migrator;
 use crate::player::player::Player;
@@ -131,12 +134,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    /*
+
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_test_writer()
         .init();
-    */
+
     let args = Args::parse();
     let base_dir = args.base_directory.clone();
     println!("base directory is: {}", base_dir.clone());
@@ -181,12 +184,37 @@ async fn main() {
 
     let db = connect_result.unwrap();
 
+    let db_clone = db.clone();
 
+    /*
+    let str = "something".to_string();
+    let item_result = item::Entity::find()
+        .filter(item::Column::FileId.eq(str))
+        .one(&db_clone)
+        .await;
+
+    if item_result.is_err() {
+        println!("error {:?}", item_result);
+    } else {
+        println!("success");
+    }
+    tokio::time::sleep(Duration::from_secs(5));
+    return;
+    
+     */
+    let (source_cmd_tx, source_cmd_rx) = mpsc::unbounded_channel::<MediaSourceCommand>();
+    let (source_evt_tx, source_evt_rx) = mpsc::unbounded_channel::<MediaSourceEvent>();
 
     let media_source = FileMediaSource::new(db.clone(), args.base_directory);
-    let media_source_clone = media_source.clone();
-    media_source_clone.scan_media().await;
+    media_source.scan_media().await;
 
+    let media_source_clone = media_source.clone();
+    tokio::spawn(async move {
+        media_source_clone.run(source_cmd_rx).await;
+    });
+
+
+    /*
 
     let player = Player::new(
         media_source_clone,
@@ -205,17 +233,18 @@ async fn main() {
     tokio::spawn(async move {
         api.run().await;
     });
-
+    */
 
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
+    let mut dispatcher = JsonRpcDispatcher::new();
+    let media_source_rpc = MediaSourceRpcHandler::new(source_cmd_tx);
+    dispatcher.add_handler(media_source_rpc);
 
-
-    println!("WebSocket server listening on ws://127.0.0.1:8080");
-
-    let handler = JsonRpcHandler::new(cmd_tx);
+    // let handler = JsonRpcHandler::new(cmd_tx);
 
     while let Ok((stream, _)) = listener.accept().await {
-        let handler = handler.clone();
+
+        let handler = dispatcher.clone();
 
         tokio::spawn(async move {
             let ws = accept_async(stream).await.unwrap();

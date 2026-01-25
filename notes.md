@@ -1271,3 +1271,333 @@ id,
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Given the following structure:
+
+```rust
+#[derive(Debug)]
+pub enum MediaSourceCommand {
+    Filter(String),
+    Find(String),
+}
+
+#[derive(Debug)]
+pub enum MediaSourceEvent {
+    FilterResults(Vec<MediaSourceItem>),
+    FindResult(Option<MediaSourceItem>),
+}
+fn main() {
+    let (source_cmd_tx, source_cmd_rx) = mpsc::unbounded_channel::<MediaSourceCommand>();
+    let (source_evt_tx, source_evt_rx) = mpsc::unbounded_channel::<MediaSourceEvent>();
+
+    let media_source = FileMediaSource::new(db.clone(), args.base_directory);
+    let media_source_clone = media_source.clone();
+    tokio::spawn(async move {
+        media_source_clone.run(source_cmd_rx, source_evt_tx).await;
+    });
+}
+```
+
+could you give me a JsonRpc example that receives a JsonRpc request, transfers it into a MediaSourceCommand, receives a MediaSourceEvent and transfers that into a JsonRpc response as quick as possible without latency? It would be great if this can be done in an extra trait JsonRpcHandler with a struct MediaSourceRpcHandler, where the trait later can be re-used to add a struct PlayerRpcHandler or other implementations.
+
+
+Nice, this is a clean actor-style setup already 👍
+Below is a **minimal, zero-extra-latency JSON-RPC bridge** that:
+
+* receives a JSON-RPC request
+* turns it into a `MediaSourceCommand`
+* waits for the corresponding `MediaSourceEvent`
+* turns that into a JSON-RPC response
+* is reusable via a **`JsonRpcHandler` trait**
+* allows adding `PlayerRpcHandler` later without changing the dispatcher
+
+The key trick is: **use a `oneshot` reply channel per request**, so you don’t poll or add buffering latency.
+
+---
+
+## 1️⃣ JsonRpcHandler trait (reusable)
+
+```rust
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait JsonRpcHandler: Send + Sync {
+    /// Returns `Some(response)` if this handler handled the method,
+    /// otherwise `None` so another handler can try.
+    async fn handle(
+        &self,
+        req: &JsonRpcRequest,
+    ) -> Option<JsonRpcResponse>;
+}
+```
+
+This lets you chain multiple handlers (`MediaSource`, `Player`, …).
+
+---
+
+## 2️⃣ MediaSourceRpcHandler
+
+This bridges **JSON-RPC ↔ MediaSourceCommand/Event**.
+
+```rust
+use tokio::sync::{mpsc, oneshot};
+use serde_json::json;
+
+#[derive(Clone)]
+pub struct MediaSourceRpcHandler {
+    cmd_tx: mpsc::UnboundedSender<MediaSourceCommand>,
+    evt_rx: mpsc::UnboundedReceiver<MediaSourceEvent>,
+}
+```
+
+### Important note about `evt_rx`
+
+Only **one task** should read from `evt_rx`.
+To keep this minimal and fast, we’ll **pair each command with a oneshot**.
+
+So we slightly wrap the command:
+
+```rust
+pub enum MediaSourceCommand {
+    Filter {
+        query: String,
+        reply: oneshot::Sender<MediaSourceEvent>,
+    },
+    Find {
+        id: String,
+        reply: oneshot::Sender<MediaSourceEvent>,
+    },
+}
+```
+
+Now `FileMediaSource::run()` simply does:
+
+```rust
+let _ = reply.send(MediaSourceEvent::FilterResults(items));
+```
+
+No extra queues, no fan-out, no latency.
+
+---
+
+## 3️⃣ MediaSourceRpcHandler implementation
+
+```rust
+#[async_trait::async_trait]
+impl JsonRpcHandler for MediaSourceRpcHandler {
+    async fn handle(
+        &self,
+        req: &JsonRpcRequest,
+    ) -> Option<JsonRpcResponse> {
+        match req.method.as_str() {
+            "file_media_source_filter" => {
+                let params: MediaSourceFilterParams =
+                    serde_json::from_value(req.params.clone()).ok()?;
+
+                let (tx, rx) = oneshot::channel();
+
+                self.cmd_tx.send(MediaSourceCommand::Filter {
+                    query: params.query,
+                    reply: tx,
+                }).ok()?;
+
+                match rx.await.ok()? {
+                    MediaSourceEvent::FilterResults(items) => {
+                        Some(JsonRpcResponse::success(
+                            req.id.clone(),
+                            json!(items),
+                        ))
+                    }
+                    _ => Some(JsonRpcResponse::error(
+                        req.id.clone(),
+                        "Unexpected media source event",
+                    )),
+                }
+            }
+
+            "file_media_source_find" => {
+                let params: MediaSourceFindParams =
+                    serde_json::from_value(req.params.clone()).ok()?;
+
+                let (tx, rx) = oneshot::channel();
+
+                self.cmd_tx.send(MediaSourceCommand::Find {
+                    id: params.id,
+                    reply: tx,
+                }).ok()?;
+
+                match rx.await.ok()? {
+                    MediaSourceEvent::FindResult(item) => {
+                        Some(JsonRpcResponse::success(
+                            req.id.clone(),
+                            json!(item),
+                        ))
+                    }
+                    _ => Some(JsonRpcResponse::error(
+                        req.id.clone(),
+                        "Unexpected media source event",
+                    )),
+                }
+            }
+
+            _ => None,
+        }
+    }
+}
+```
+
+### Why this is fast
+
+* no shared mutex
+* no polling
+* no buffering
+* single await on a `oneshot`
+* direct wake-up when the result is ready
+
+---
+
+## 4️⃣ Dispatcher that supports multiple handlers
+
+```rust
+#[derive(Clone)]
+pub struct JsonRpcDispatcher {
+    handlers: Vec<std::sync::Arc<dyn JsonRpcHandler>>,
+}
+
+impl JsonRpcDispatcher {
+    pub fn new() -> Self {
+        Self { handlers: Vec::new() }
+    }
+
+    pub fn add_handler<H>(&mut self, handler: H)
+    where
+        H: JsonRpcHandler + 'static,
+    {
+        self.handlers.push(std::sync::Arc::new(handler));
+    }
+
+    pub async fn handle_request(
+        &self,
+        req: JsonRpcRequest,
+    ) -> JsonRpcResponse {
+        for handler in &self.handlers {
+            if let Some(resp) = handler.handle(&req).await {
+                return resp;
+            }
+        }
+
+        JsonRpcResponse::error(req.id, "Unknown method")
+    }
+}
+```
+
+---
+
+## 5️⃣ Wiring it up in `main`
+
+```rust
+fn main() {
+    let (source_cmd_tx, source_cmd_rx) =
+        mpsc::unbounded_channel::<MediaSourceCommand>();
+
+    let media_source = FileMediaSource::new(db.clone(), args.base_directory);
+    tokio::spawn(media_source.run(source_cmd_rx));
+
+    let media_source_rpc = MediaSourceRpcHandler {
+        cmd_tx: source_cmd_tx,
+    };
+
+    let mut dispatcher = JsonRpcDispatcher::new();
+    dispatcher.add_handler(media_source_rpc);
+
+    // later in websocket task:
+    let response = dispatcher.handle_request(req).await;
+}
+
+```
+
+---
+
+## 6️⃣ JSON-RPC example
+
+### Request
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "file_media_source_filter",
+  "params": {
+    "query": "beatles"
+  }
+}
+```
+
+### Response
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    { "id": "1", "title": "Hey Jude" },
+    { "id": "2", "title": "Let It Be" }
+  ]
+}
+```
+
+---
+
+## Why this design scales beautifully
+
+* ✅ MediaSource runs on **one task**
+* ✅ JSON-RPC handlers are **Send + cheap**
+* ✅ No shared mutable state
+* ✅ Adding `PlayerRpcHandler` is trivial
+* ✅ Latency is basically “task wakeup + processing”
+
+If you want next, I can:
+
+* show the `PlayerRpcHandler` side-by-side
+* add JSON-RPC **notifications** (no `id`)
+* or add request cancellation / timeouts
+
+This is a really solid architecture — you’re very much on the right track.
+
+

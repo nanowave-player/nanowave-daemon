@@ -24,7 +24,6 @@ use walkdir::WalkDir;
 use crate::entity::item::{ActiveModel, ActiveModelEx};
 use crate::entity::items_json_metadata::JsonTagField::Chapters;
 use crate::entity::items_metadata::TagField::*;
-use crate::entity::items_metadata::{Entity, TagField};
 use crate::entity::{item, items_json_metadata, items_metadata};
 use crate::media_source::media_source::MediaSource;
 use crate::media_source::media_source_command::MediaSourceCommand;
@@ -73,7 +72,7 @@ impl FileMediaSource {
             chapters: vec![],
         }
     }
-    pub fn map_db_model_to_media_item(&self, i: &item::ModelEx, metadata: &HasMany<Entity>, json: &HasMany<items_json_metadata::Entity>) -> MediaSourceItem {
+    pub fn map_db_model_to_media_item(&self, i: &item::ModelEx, metadata: &HasMany<items_metadata::Entity>, json: &HasMany<items_json_metadata::Entity>) -> MediaSourceItem {
         let mut title : String = String::from("");
         let mut genre : Option<String> = None;
         let mut artist : Option<String> = None;
@@ -217,7 +216,7 @@ impl FileMediaSource {
         res.unwrap()
     }
 
-    fn add_metadata(&self, metadata: &mut HasManyModel<Entity>, tag_field: TagField, value: Option<String>, date_modified: DateTime<Utc>) {
+    fn add_metadata(&self, metadata: &mut HasManyModel<items_metadata::Entity>, tag_field: items_metadata::TagField, value: Option<String>, date_modified: DateTime<Utc>) {
         if value.is_some() {
             metadata.push(items_metadata::ActiveModel::builder()
                 .set_tag_field(tag_field)
@@ -283,14 +282,17 @@ impl FileMediaSource {
             let file_date_modified = audio_file.path().metadata().unwrap().modified().unwrap();
             let file_date_mod_compare: DateTime<Local> = DateTime::from(file_date_modified);
 
-            let item_result = Entity::find()
+            println!("check entity");
+            let item_result = item::Entity::find()
                 .filter(item::Column::FileId.eq(file_id_str.clone()))
                 .one(&db)
                 .await;
-
+            println!("item result");
             if item_result.is_err() {
+                println!("result err {:?}", item_result);
                 continue;
             }
+            println!("result ok");
             let item_option = item_result.unwrap();
 
             let (item_is_modified, id) = if let Some(item) = item_option {
@@ -470,7 +472,7 @@ impl MediaSource for FileMediaSource {
 
         let items = item::Entity::load()
                 .filter(item::Column::MediaType.eq(media_type))
-                .with(Entity)
+                .with(items_metadata::Entity)
                 .all(&db)
                 .await;
         if items.is_err() {
@@ -489,7 +491,7 @@ impl MediaSource for FileMediaSource {
         let db = self.db.clone();
         let items = item::Entity::load()
             .filter(item::Column::Id.eq(id))
-            .with(Entity)
+            .with(items_metadata::Entity)
             .with(items_json_metadata::Entity)
             .one(&db)
             .await;
@@ -509,17 +511,15 @@ impl MediaSource for FileMediaSource {
     async fn run(
         mut self,
         mut cmd_rx: UnboundedReceiver<MediaSourceCommand>,
-        evt_tx: UnboundedSender<MediaSourceEvent>,
     ) {
+
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                MediaSourceCommand::Filter(query) => {
-                    let results = self.filter(&query).await;
-                    let _ = evt_tx.send(MediaSourceEvent::FilterResults(results));
+                MediaSourceCommand::Filter { query, reply } => {
+                    let _ = reply.send( MediaSourceEvent::FilterResults(self.filter(&query).await));
                 }
-                MediaSourceCommand::Find(id) => {
-                    let result = self.find(&id).await;
-                    let _ = evt_tx.send(MediaSourceEvent::FindResult(result));
+                MediaSourceCommand::Find { id, reply } => {
+                    let _ = reply.send( MediaSourceEvent::FindResult( self.find(&id).await));
                 }
             }
         }

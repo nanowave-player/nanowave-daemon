@@ -13,7 +13,6 @@ pub trait MediaSource: Send + Sync {
     /// Async run loop - consumes self
     async fn run(
         self,
-        cmd_rx: UnboundedReceiver<MediaSourceCommand>,
-        evt_tx: UnboundedSender<MediaSourceEvent>,
+        cmd_rx: UnboundedReceiver<MediaSourceCommand>
     );
 }

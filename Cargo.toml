@@ -22,7 +22,7 @@ mp4ameta = "0.13.0"
 sea-orm = { version = "2.0.0-rc.21", features = [ "sqlx-sqlite", "macros", "runtime-tokio", "debug-print", "with-chrono", "with-json" ] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.22"
-sea-orm-migration = "2.0.0-rc.21"
+sea-orm-migration = "2.0.0-rc.28"
 file-id = "0.2.3"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 image = "0.25.9"
