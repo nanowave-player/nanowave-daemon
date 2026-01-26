@@ -268,10 +268,12 @@ impl FileMediaSource {
         for audio_file in audio_files {
             let full_path = audio_file.path().to_str().unwrap().to_string();
             let start_index = base_path.len();
-            let rel_path = full_path[start_index..].to_string();
-            let media_type = if rel_path.starts_with("/music/") {
+            let rel_path = full_path[start_index..].trim_start_matches('/').to_string();
+
+            // audiobooks instead of /audioboks/
+            let media_type = if rel_path.starts_with("music/") {
                 item::MediaType::Music
-            } else if rel_path.starts_with("/audiobooks/") {
+            } else if rel_path.starts_with("audiobooks/") {
                 item::MediaType::Audiobook
             } else {
                 item::MediaType::Unspecified
@@ -461,6 +463,9 @@ impl MediaSource for FileMediaSource {
     }
 
     async fn filter(&self, query: &str) -> Vec<MediaSourceItem> {
+        println!("filter");
+
+
         let db = self.db.clone();
 
         // let q = query.to_lowercase();
@@ -476,7 +481,23 @@ impl MediaSource for FileMediaSource {
                 .all(&db)
                 .await;
         if items.is_err() {
-            return vec![];
+            return vec![MediaSourceItem{
+                id: "".to_string(),
+                location: "".to_string(),
+                title: "error".to_string(),
+                media_type: MediaType::Unspecified,
+                metadata: MediaSourceMetadata {
+                    artist: None,
+                    title: None,
+                    album: None,
+                    genre: None,
+                    composer: None,
+                    series: None,
+                    part: None,
+                    cover: None,
+                    chapters: vec![],
+                },
+            }];
         }
 
         let items = items.unwrap();

@@ -5,6 +5,10 @@ media_source_filter
 {"jsonrpc": "2.0", "method":"media_source_filter", "params": {"query":"2"}, "id": "1"}
 ```
 
+```json
+{"jsonrpc": "2.0", "method":"media_source_find", "params": {"id":"2"}, "id": "1"}
+
+```
 
 
 Nice, this is a good point to “lock in” a clean baseline.
