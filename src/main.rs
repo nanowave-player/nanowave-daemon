@@ -134,11 +134,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-
+/*
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_test_writer()
         .init();
+
+ */
 
     let args = Args::parse();
     let base_dir = args.base_directory.clone();
@@ -200,7 +202,7 @@ async fn main() {
     }
     tokio::time::sleep(Duration::from_secs(5));
     return;
-    
+
      */
     let (source_cmd_tx, source_cmd_rx) = mpsc::unbounded_channel::<MediaSourceCommand>();
     let (source_evt_tx, source_evt_rx) = mpsc::unbounded_channel::<MediaSourceEvent>();
@@ -244,6 +246,8 @@ async fn main() {
 
     while let Ok((stream, _)) = listener.accept().await {
 
+        println!("new client deteced");
+
         let handler = dispatcher.clone();
 
         tokio::spawn(async move {
@@ -255,8 +259,16 @@ async fn main() {
                     continue;
                 }
 
+                let text = msg.to_text();
+                if text.is_err() {
+                    continue;
+                }
+                let json = serde_json::from_str(text.unwrap());
+                if json.is_err() {
+                    continue;
+                }
                 let req: JsonRpcRequest =
-                    serde_json::from_str(msg.to_text().unwrap()).unwrap();
+                    json.unwrap();
 
                 let resp = handler.handle_request(req).await;
                 let text = serde_json::to_string(&resp).unwrap();

@@ -116,6 +116,9 @@ impl JsonRpcHandler for MediaSourceRpcHandler {
         &self,
         req: &JsonRpcRequest,
     ) -> Option<JsonRpcResponse> {
+
+        println!("MediaSourceRpcHandler::handle");
+
         let req_params_opt = req.params.clone();
         if req_params_opt.is_none() {
             return None;
@@ -216,6 +219,8 @@ impl JsonRpcDispatcher {
         &self,
         req: JsonRpcRequest,
     ) -> JsonRpcResponse {
+        println!("JsonRpcDispatcher::handle_request");
+
         for handler in &self.handlers {
             if let Some(resp) = handler.handle(&req).await {
                 return resp;

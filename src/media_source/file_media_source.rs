@@ -284,17 +284,17 @@ impl FileMediaSource {
             let file_date_modified = audio_file.path().metadata().unwrap().modified().unwrap();
             let file_date_mod_compare: DateTime<Local> = DateTime::from(file_date_modified);
 
-            println!("check entity");
+            // println!("check entity");
             let item_result = item::Entity::find()
                 .filter(item::Column::FileId.eq(file_id_str.clone()))
                 .one(&db)
                 .await;
-            println!("item result");
+            // println!("item result");
             if item_result.is_err() {
                 println!("result err {:?}", item_result);
                 continue;
             }
-            println!("result ok");
+            // println!("result ok");
             let item_option = item_result.unwrap();
 
             let (item_is_modified, id) = if let Some(item) = item_option {
