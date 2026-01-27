@@ -127,6 +127,7 @@ impl JsonRpcHandler for MediaSourceRpcHandler {
 
         match req.method.as_str() {
             "media_source_filter" => {
+                println!("media_source_filter");
 
                 let params: MediaSourceFilterParams =
                     serde_json::from_value(req_params).ok()?;
@@ -153,6 +154,7 @@ impl JsonRpcHandler for MediaSourceRpcHandler {
             }
 
             "media_source_find" => {
+                println!("media_source_find");
                 let params: MediaSourceFindParams =
                     serde_json::from_value(req_params).ok()?;
 
